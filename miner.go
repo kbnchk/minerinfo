@@ -1,6 +1,7 @@
 package minerinfo
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -26,83 +27,93 @@ func New(ip string, port uint16, timeout time.Duration) (Miner, error) {
 		return nil, fmt.Errorf("error parsing ip address: %w", err)
 	}
 	addr := netip.AddrPortFrom(ipaddr, port)
-
-	info, err := getInfo(addr, timeout)
+	h := hostNew(addr, timeout)
+	err = h.getInfo()
 	if err != nil {
 		return nil, err
 	}
-	return detectMiner(info), nil
+	return h.detectMiner(), nil
+}
+
+type host struct {
+	addr    netip.AddrPort
+	info    minerInfo
+	timeout time.Duration
+}
+
+func hostNew(addr netip.AddrPort, timeout time.Duration) host {
+	return host{
+		addr:    addr,
+		info:    minerInfo{},
+		timeout: timeout,
+	}
 }
 
 // Detects miner type
 // Determining the type of miner using the cgminer api is difficult, since different manufacturers and models
 // have their own api implementation and the amount of information returned can vary significantly.
 // Therefore, this implementation is based only on known types of miners and the information returned by them.
-func detectMiner(info minerInfo) Miner {
+func (h *host) detectMiner() Miner {
 	var typestring string
-	if len(info.Stats) > 0 && info.Stats[0].Type != "" {
-		typestring = info.Stats[0].Type
+	if len(h.info.Stats) > 0 && h.info.Stats[0].Type != "" {
+		typestring = h.info.Stats[0].Type
 	} else {
-		if len(info.Devdetails) > 0 && info.Devdetails[0].Name != "" {
-			typestring = info.Devdetails[0].Name
+		if len(h.info.Devdetails) > 0 && h.info.Devdetails[0].Name != "" {
+			typestring = h.info.Devdetails[0].Name
+
 		}
 	}
+
 	if strings.Split(typestring, " ")[0] == "Antminer" {
-		return antminer{genericMiner{info}}
+		return antminer{genericMiner{h.info}}
 	}
 
 	if typestring == "SM" {
-		return whatsminer{genericMiner{info}}
-
+		return whatsminer{genericMiner{h.info}}
 	}
-	return genericMiner{info}
+	return genericMiner{h.info}
 }
 
-func getInfo(addr netip.AddrPort, timeout time.Duration) (minerInfo, error) {
-	var info minerInfo
-	var reqErr error
+// collects miner information
+func (h *host) getInfo() error {
 	commands := []string{"stats", "summary", "devdetails", "pools"}
-
-	for _, command := range commands {
-		req := minerRequest{
-			Command: command,
-		}
-
-		conn, err := net.DialTimeout("tcp", addr.String(), timeout)
+	for _, cmd := range commands {
+		err := h.exec(cmd, &h.info)
 		if err != nil {
-			return info, fmt.Errorf("error connecting miner: %w", err)
-		}
-		defer conn.Close()
-
-		conn.SetDeadline(time.Now().Add(timeout))
-		reqErr = sendCommand(conn, req, &info)
-		if reqErr != nil {
-			break
+			return err
 		}
 	}
-	return info, reqErr
+	return nil
 }
 
-func sendCommand(conn io.ReadWriter, req minerRequest, resp *minerInfo) error {
-	reqBytes, _ := json.Marshal(req)
-
-	_, err := conn.Write(reqBytes)
+// Establishes connection sends command and recieves responce
+func (h *host) exec(cmd string, v any) error {
+	conn, err := net.DialTimeout("tcp", h.addr.String(), h.timeout)
 	if err != nil {
-		return fmt.Errorf("error sending command %s: %w", req.Command, err)
+		return fmt.Errorf("error connecting to host: %w", err)
 	}
-
-	respBytes, err := io.ReadAll(conn)
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(h.timeout))
+	req := minerRequest{
+		Command: cmd,
+	}
+	err = json.NewEncoder(conn).Encode(req)
 	if err != nil {
-		return fmt.Errorf("error reading response for command %s: %w", req.Command, err)
+		return err
 	}
-
-	respBytes = bytes.Replace(respBytes, []byte("}{"), []byte("},{"), 1) // L3 buggy json output fix
-	respBytes = bytes.TrimRight(respBytes, "\x00")
-
-	err = json.Unmarshal(respBytes, resp)
+	r, err := connReader(conn)
 	if err != nil {
-		return fmt.Errorf("error umarshalling response for command %s: %w", req.Command, err)
+		return err
 	}
+	decoder := json.NewDecoder(r)
+	return decoder.Decode(v)
+}
 
-	return nil
+func connReader(c net.Conn) (io.Reader, error) {
+	result, err := bufio.NewReader(c).ReadBytes(0x00)
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+	result = bytes.Replace(result, []byte("}{"), []byte("},{"), 1) //Antminer L3 buggy json output fix
+	return bytes.NewReader(bytes.TrimRight(result, "\x00")), nil
 }
